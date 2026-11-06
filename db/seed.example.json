@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy to db/seed.json (git-ignored), replace with real staff and your leave policy, then run: npm run db:seed. Users without a password get a random temporary one printed to the console. Re-running updates names/roles/entitlements but never overwrites an existing user's password or used_days.",
+  "users": [
+    {
+      "email": "manager@company.com",
+      "name": "Jane Smith",
+      "role": "manager",
+      "balances": { "Vacation": 18, "Sick": 10 }
+    },
+    {
+      "email": "employee@company.com",
+      "name": "John Doe",
+      "role": "employee",
+      "balances": { "Vacation": 15, "Sick": 10 }
+    }
+  ]
+}
