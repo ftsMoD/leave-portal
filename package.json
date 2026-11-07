@@ -1,6 +1,6 @@
 {
   "name": "leave-portal",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "engines": {
     "node": "22.x"
@@ -11,17 +11,19 @@
     "preview": "vite preview",
     "test": "node --test tests/api.test.js",
     "db:init": "node scripts/db-init.js",
-    "db:seed": "node scripts/db-seed.js"
+    "setup-sql": "node scripts/make-setup-sql.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "express": "^4.22.3",
     "jsonwebtoken": "^9.0.3",
+    "nodemailer": "10.1.7",
     "pg": "^8.23.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "0.5.10",
     "@vitejs/plugin-react": "^4.7.0",
     "autoprefixer": "^10.4.21",
     "postcss": "^8.5.6",

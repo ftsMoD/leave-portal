@@ -2,72 +2,199 @@
 // vercel.json rewrites /api/* here; Express routes on the original path.
 
 const express = require('express');
-const { getStore } = require('../server/store');
-const { login, requireAuth, changePassword } = require('../server/auth');
-const { applyForLeave, decideRequest, cancelRequest } = require('../server/leave');
+const { getDb, databaseStatus } = require('../server/db');
+const auth = require('../server/auth');
+const leave = require('../server/leave');
+const staff = require('../server/staff');
+const reports = require('../server/reports');
+const mailer = require('../server/mailer');
+const { currentYear } = require('../server/dates');
 const { httpError, asyncHandler } = require('../server/errors');
 
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json({ limit: '20kb' }));
-// No CORS middleware: frontend and API share one origin on Vercel.
+app.use(express.json({ limit: '50kb' }));
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
 
-const auth = requireAuth(getStore);
+const signedIn = auth.requireAuth(getDb);
+const signedInAllowPending = auth.requireAuth(getDb, { allowPasswordChangePending: true });
+const adminOnly = (req, res, next) => (req.user.role === 'admin' ? next() : next(httpError(403, 'Administrators only.')));
+const withDb = asyncHandler(async (req, res, next) => { req.db = await getDb(); next(); });
 
 const parseId = (value) => {
   const id = Number(value);
   if (!Number.isInteger(id) || id <= 0) throw httpError(400, 'Invalid id.');
   return id;
 };
+const parseYear = (value) => {
+  const y = Number(value);
+  return Number.isInteger(y) && y >= 2000 && y <= 2100 ? y : currentYear();
+};
+const sendCsv = (res, filename, csv) => {
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(csv);
+};
 
 // --- HEALTH ---
-app.get('/api/health', (req, res) => {
-  res.json({ ok: true, storage: getStore().kind });
+app.get('/api/health', asyncHandler(async (req, res) => {
+  res.json({
+    ok: true,
+    database: await databaseStatus(),
+    email: mailer.emailConfigured(),
+    app_url: Boolean(mailer.appUrl()),
+    year: currentYear(),
+  });
+}));
+
+// --- AUTH ---
+app.post('/api/auth/login', withDb, asyncHandler(async (req, res) => {
+  res.json(await auth.login(req.db, req.body));
+}));
+app.post('/api/auth/forgot', withDb, asyncHandler(async (req, res) => {
+  res.json(await auth.requestPasswordReset(req.db, req.body));
+}));
+app.post('/api/auth/reset', withDb, asyncHandler(async (req, res) => {
+  res.json(await auth.resetPassword(req.db, req.body));
+}));
+app.get('/api/auth/me', signedInAllowPending, (req, res) => {
+  res.json({ user: auth.publicUser(req.user) });
 });
-
-// --- AUTH ROUTES ---
-app.post('/api/auth/login', asyncHandler(async (req, res) => {
-  const { token, user } = await login(getStore(), req.body);
-  res.json({ token, user });
+app.post('/api/auth/password', signedInAllowPending, asyncHandler(async (req, res) => {
+  res.json(await auth.changePassword(req.db, req.user, req.body));
 }));
 
-app.get('/api/auth/me', auth, (req, res) => {
-  res.json({ user: req.user });
-});
-
-app.post('/api/auth/password', auth, asyncHandler(async (req, res) => {
-  await changePassword(getStore(), req.user, req.body);
-  res.json({ message: 'Password updated.' });
+// --- LEAVE ---
+app.get('/api/leave-types', signedIn, asyncHandler(async (req, res) => {
+  res.json(await staff.listLeaveTypes(req.db.query));
 }));
 
-// --- LEAVE ROUTES ---
-// :userId may be "me". Employees can only read their own balances.
-app.get('/api/balances/:userId', auth, asyncHandler(async (req, res) => {
-  const userId = req.params.userId === 'me' ? req.user.id : parseId(req.params.userId);
-  if (userId !== req.user.id && req.user.role !== 'manager') throw httpError(403, 'Not allowed.');
-  res.json(await getStore().listBalances(userId));
+// Leave types this user can request (N/A and location rules applied).
+app.get('/api/my/leave-options', signedIn, asyncHandler(async (req, res) => {
+  const rows = await leave.allowedTypes(req.db.query, [req.user.id]);
+  res.json(rows.map((r) => ({ leave_type: r.leave_type, unlimited: r.days_per_year === null })));
 }));
 
-// Employees always get their own requests. Managers get everyone's unless ?scope=mine.
-app.get('/api/leave/requests', auth, asyncHandler(async (req, res) => {
-  const ownOnly = req.user.role !== 'manager' || req.query.scope === 'mine';
-  res.json(await getStore().listRequests(ownOnly ? { userId: req.user.id } : {}));
+app.get('/api/balances', signedIn, asyncHandler(async (req, res) => {
+  res.json(await leave.listBalances(req.db, req.user, { scope: req.query.scope || 'mine', year: parseYear(req.query.year) }));
 }));
 
-// The applicant is always the signed-in user; any user_id in the body is ignored.
-app.post('/api/leave/apply', auth, asyncHandler(async (req, res) => {
-  const request = await applyForLeave(getStore(), req.user, req.body);
-  res.status(201).json({ message: 'Leave request submitted successfully.', request });
+app.get('/api/requests', signedIn, asyncHandler(async (req, res) => {
+  res.json(await leave.listRequests(req.db, req.user, {
+    scope: req.query.scope || 'mine',
+    year: req.query.year ? parseYear(req.query.year) : undefined,
+    status: req.query.status,
+  }));
 }));
 
-// Managers: { status: "Approved" | "Rejected" }. Owners: { status: "Cancelled" } while pending.
-app.patch('/api/leave/requests/:id', auth, asyncHandler(async (req, res) => {
+app.post('/api/requests', signedIn, asyncHandler(async (req, res) => {
+  const { request, recipients } = await leave.applyForLeave(req.db, req.user, req.body);
+  const email = await mailer.sendNewRequest(recipients, request);
+  res.status(201).json({
+    message: `Request submitted to ${recipients.map((r) => r.name).join(', ') || 'HR'} for approval.`,
+    request,
+    email,
+  });
+}));
+
+// { status: "Cancelled" } by the owner, or { status: "Approved" | "Rejected", note } by line manager / HR.
+app.patch('/api/requests/:id', signedIn, asyncHandler(async (req, res) => {
   const id = parseId(req.params.id);
-  const status = req.body?.status;
-  const request = status === 'Cancelled'
-    ? await cancelRequest(getStore(), req.user, id)
-    : await decideRequest(getStore(), req.user, id, status);
-  res.json({ message: `Request ${status.toLowerCase()}.`, request });
+  const { status, note } = req.body || {};
+  if (status === 'Cancelled') {
+    return res.json({ message: 'Request cancelled.', request: await leave.cancelRequest(req.db, req.user, id) });
+  }
+  const { request, employee } = await leave.decideRequest(req.db, req.user, id, status, note);
+  const email = await mailer.sendDecision(employee, request);
+  res.json({ message: `${employee.name}'s request ${status.toLowerCase()}.`, request, email });
+}));
+
+// --- ADMIN: requests ---
+app.post('/api/admin/requests', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  res.status(201).json({ message: 'Leave recorded.', request: await leave.adminCreateRequest(req.db, req.user, req.body) });
+}));
+app.put('/api/admin/requests/:id', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  const { request, employee, statusChanged } = await leave.adminUpdateRequest(req.db, req.user, parseId(req.params.id), req.body);
+  const email = statusChanged && ['Approved', 'Rejected'].includes(request.status) ? await mailer.sendDecision(employee, request) : null;
+  res.json({ message: 'Request updated.', request, email });
+}));
+app.delete('/api/admin/requests/:id', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  await leave.adminDeleteRequest(req.db, req.user, parseId(req.params.id));
+  res.json({ message: 'Request deleted.' });
+}));
+
+// --- ADMIN: staff ---
+app.get('/api/admin/staff', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  res.json(await staff.listStaff(req.db));
+}));
+app.post('/api/admin/staff', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  res.status(201).json({ message: 'Staff member added.', ...(await staff.createStaff(req.db, req.user, req.body)) });
+}));
+app.put('/api/admin/staff/:id', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  res.json({ message: 'Staff member updated.', ...(await staff.updateStaff(req.db, req.user, parseId(req.params.id), req.body)) });
+}));
+app.delete('/api/admin/staff/:id', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  await staff.deleteStaff(req.db, req.user, parseId(req.params.id));
+  res.json({ message: 'Staff member deleted.' });
+}));
+app.post('/api/admin/staff/:id/temp-password', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  const { password, user } = await auth.setTemporaryPassword(req.db, req.user, parseId(req.params.id));
+  res.json({ password, message: `Temporary password set for ${user.name}. They must change it at first sign-in.` });
+}));
+app.post('/api/admin/staff/:id/setup-email', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  res.json(await auth.sendSetupEmail(req.db, req.user, parseId(req.params.id)));
+}));
+
+// --- ADMIN: balance adjustments ---
+app.get('/api/admin/adjustments', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  res.json(await staff.listAdjustments(req.db, {
+    userId: req.query.user_id ? parseId(req.query.user_id) : null,
+    year: req.query.year ? parseYear(req.query.year) : null,
+  }));
+}));
+app.post('/api/admin/adjustments', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  res.status(201).json({ message: 'Balance adjusted.', ...(await staff.createAdjustment(req.db, req.user, req.body)) });
+}));
+app.delete('/api/admin/adjustments/:id', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  await staff.deleteAdjustment(req.db, req.user, parseId(req.params.id));
+  res.json({ message: 'Adjustment removed.' });
+}));
+
+// --- ADMIN: reports ---
+app.get('/api/admin/reports/summary', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  res.json(await reports.summary(req.db));
+}));
+
+// --- EXPORTS (CSV) ---
+app.get('/api/export/my-requests.csv', signedIn, asyncHandler(async (req, res) => {
+  const year = parseYear(req.query.year);
+  const rows = await leave.listRequests(req.db, req.user, { scope: 'mine', year });
+  sendCsv(res, `my-leave-history-${year}.csv`, reports.requestsCsv(rows, { withEmployee: false }));
+}));
+app.get('/api/export/my-balances.csv', signedIn, asyncHandler(async (req, res) => {
+  const year = parseYear(req.query.year);
+  const people = await leave.listBalances(req.db, req.user, { scope: 'mine', year });
+  sendCsv(res, `my-leave-balances-${year}.csv`, reports.balancesCsv(people, year, { withEmployee: false }));
+}));
+app.get('/api/export/requests.csv', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  const year = parseYear(req.query.year);
+  const rows = await leave.listRequests(req.db, req.user, { scope: 'all', year, status: req.query.status });
+  sendCsv(res, `leave-requests-${year}.csv`, reports.requestsCsv(rows));
+}));
+app.get('/api/export/balances.csv', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  const year = parseYear(req.query.year);
+  const people = await leave.listBalances(req.db, req.user, { scope: 'all', year });
+  sendCsv(res, `leave-balances-${year}.csv`, reports.balancesCsv(people, year));
+}));
+app.get('/api/export/staff.csv', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  const [list, types] = await Promise.all([staff.listStaff(req.db), staff.listLeaveTypes(req.db.query)]);
+  sendCsv(res, 'staff-entitlements.csv', reports.staffCsv(list, types));
+}));
+app.get('/api/export/activity.csv', signedIn, adminOnly, asyncHandler(async (req, res) => {
+  sendCsv(res, 'leave-activity-log.csv', await reports.activityCsv(req.db));
 }));
 
 // --- FALLTHROUGH + ERRORS ---

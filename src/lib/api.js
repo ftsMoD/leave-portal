@@ -28,16 +28,38 @@ export async function apiRequest(path, { method = 'GET', body, token } = {}) {
   return data;
 }
 
+async function download(path, token) {
+  const res = await fetch(`/api${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  if (!res.ok) {
+    let message = `Download failed (${res.status}).`;
+    try { message = (await res.json()).error || message; } catch { /* not JSON */ }
+    throw new ApiError(message, res.status);
+  }
+  const blob = await res.blob();
+  const match = (res.headers.get('content-disposition') || '').match(/filename="([^"]+)"/);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = match?.[1] || 'export.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // Returns an api() bound to a token; calls onUnauthorized on any 401.
 export function createApi(token, onUnauthorized) {
-  return async (path, options = {}) => {
+  const guard = async (fn) => {
     try {
-      return await apiRequest(path, { ...options, token });
+      return await fn();
     } catch (err) {
       if (err.status === 401) onUnauthorized?.(err.message);
       throw err;
     }
   };
+  const api = (path, options = {}) => guard(() => apiRequest(path, { ...options, token }));
+  api.download = (path) => guard(() => download(path, token));
+  return api;
 }
 
 const SESSION_KEY = 'leavePortalSession';

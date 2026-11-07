@@ -1,129 +1,101 @@
-# Leave Portal — Vercel monorepo
+# Leave Portal
 
-React (Vite + Tailwind) frontend and an Express API deployed together on Vercel. The API runs as one serverless function (`api/index.js`). Data lives in Postgres, or in memory when no database is configured (demo mode).
+Leave requests, line-manager approvals, balances, email notifications, exports and live reports. It's a React (Vite + Tailwind) frontend and an Express API, deployed together on Vercel, with data in Postgres (Neon).
 
-## Project structure
+> **Keep staff data out of this repo.** The generated `setup.sql` and any staff list stay off GitHub. The demo data in `server/demo.js` is fictional.
+
+## Roles
+
+| Role | Can do |
+|---|---|
+| **User** | Request leave, cancel their own pending requests, see their own balances and history, download their own CSVs |
+| **Approver** | Everything a User can do, plus approve or reject requests from **direct reports** and see their balances (My team) |
+| **Administrator** | Everything an Approver can do, plus approve any request (the backup when a line manager can't), add, edit or delete any leave record, manage staff, roles, entitlements and balance adjustments, see live reports and download reports |
+
+Nobody can approve their own leave, including the Administrator.
+
+## Leave rules
+
+- **Entitlement "N/A"** means the leave type is hidden from that person's dropdown.
+- **"Unlimited"** types (Unpaid and Other) have no balance limit. A *Type of leave* note is required, for example "Bereavement". Admins can edit it later.
+- **Childcare Leave is Singapore-only.** It's hidden for anyone whose location isn't Singapore, even if an entitlement exists.
+- **Working days** are Monday to Friday. Public holidays are booked as their own leave type, with 11 days a year.
+- **Leave year** is the calendar year. Entitlements reset on 1 January and unused days don't carry forward. A request that spans New Year is split across both years.
+- **Available** = entitlement + adjustments − approved − pending. It's checked when someone submits a request and checked again on approval.
+- **Overlapping** pending or approved requests are rejected.
+
+## Notifications
+
+- When someone submits a request, their **line manager** gets an email with a link that opens the request. If they have no line manager, the email goes to the Administrators.
+- When a request is approved or rejected, the **employee** gets an email with the approver's comment.
+- If the Administrator issues a set-up email or someone uses "Forgot password", they get a link that expires after 72 hours (set-up) or 1 hour (reset).
+
+If SMTP isn't configured, the portal works without email and shows the Administrator a banner.
+
+## Security
+
+- Passwords are hashed with bcrypt and must be at least 10 characters. Temporary passwords must be changed at first sign-in.
+- An account locks for 15 minutes after 5 failed sign-ins. The lock is stored in the database, so it works across serverless instances.
+- Sessions use JWTs that expire after 8 hours. Changing or resetting a password, or deactivating the account, signs the user out everywhere.
+- Every change is written to an audit log, which appears under Reports → Recent activity and can be exported.
+- CSV exports are protected against formula injection.
+
+## Deploy (Vercel + Neon)
+
+1. Import this repo into Vercel. The framework (Vite) and the `/api` rewrite are set in `vercel.json`.
+2. Add a database under **Storage**: Neon (Postgres), connected to the project for all environments. This sets `DATABASE_URL`.
+3. Create the tables and staff. Run `npm run setup-sql -- staff.json > setup.sql` (format documented in `scripts/make-setup-sql.js`), paste `setup.sql` into Neon's SQL Editor and run it. This prints the Administrator's temporary password.
+4. Add environment variables (see `.env.example`): `JWT_SECRET`, `APP_URL`, and the `SMTP_*` and `MAIL_FROM` settings.
+5. Redeploy. `/api/health` should show `"database":"postgres","email":true`.
+
+### Email with Google Workspace
+
+Use a mailbox such as `leave@yourcompany.com`. That account needs 2-Step Verification turned on so you can create an **App Password** (Google Account → Security → App passwords). Then set:
 
 ```
-leave-portal/
-├── api/
-│   └── index.js            # Express backend (Vercel serverless function)
-├── server/                 # Backend modules, bundled into the function
-│   ├── auth.js             # login, JWT, password change
-│   ├── leave.js            # leave workflow rules
-│   ├── dates.js            # working-day calculation
-│   └── store/              # storage: postgres.js | memory.js (demo)
-├── src/
-│   ├── App.jsx             # shell, login, tabs
-│   ├── views/              # EmployeeView.jsx, ManagerView.jsx
-│   ├── components.jsx
-│   ├── lib/                # api.js, dates.js
-│   ├── main.jsx            # React entry point
-│   └── index.css           # Tailwind imports
-├── db/
-│   ├── schema.sql
-│   └── seed.example.json   # copy to db/seed.json (git-ignored)
-├── scripts/                # db-init.js, db-seed.js
-├── tests/api.test.js
-├── index.html
-├── package.json
-├── tailwind.config.js
-├── postcss.config.js
-├── vite.config.mjs
-└── vercel.json
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_USER=leave@yourcompany.com
+SMTP_PASS=<16-character app password, no spaces>
+MAIL_FROM=Leave Portal <leave@yourcompany.com>
 ```
 
-## Run locally
+Your Workspace admin may need to allow app passwords. `MAIL_FROM` must be that mailbox or one of its "Send mail as" aliases. Any other SMTP provider (Resend, SendGrid, Microsoft 365) also works.
+
+## Local development
 
 ```bash
 npm install
-npm run dev          # http://localhost:5173 (frontend and /api on one port)
+npm run dev     # http://localhost:5173 — demo data in memory (PGlite), no setup needed
+npm test        # API tests on PGlite
+TEST_DATABASE_URL=postgres://... npm test   # same tests on real Postgres (DROPS the app tables there)
 ```
 
-If `DATABASE_URL` isn't set, the app runs in **demo mode**. You can sign in as `employee@company.com` or `manager@company.com`, both with the password `password123`. Restart `npm run dev` after you change any file under `api/` or `server/`.
+Demo sign-ins use the password `password123`: `admin@example.com` (Administrator), `ceo@example.com` (Approver) and `employee@example.com` (User).
 
-```bash
-npm test             # API tests (in-memory)
-TEST_DATABASE_URL=postgres://... npm test   # same tests against Postgres. This DROPS the app tables in that DB.
-```
+## API overview
 
-## Deploy to Vercel
+| Method | Path | Who |
+|---|---|---|
+| POST | `/api/auth/login` · `/forgot` · `/reset` | anyone |
+| GET/POST | `/api/auth/me` · `/api/auth/password` | signed in |
+| GET | `/api/my/leave-options` | signed in |
+| GET | `/api/balances?scope=mine\|team\|all&year=` | own / approver / admin |
+| GET | `/api/requests?scope=mine\|approvals\|all&year=&status=` | own / approver / admin |
+| POST | `/api/requests` | signed in (apply) |
+| PATCH | `/api/requests/:id` | owner (`Cancelled`), line manager or admin (`Approved`/`Rejected`) |
+| POST/PUT/DELETE | `/api/admin/requests[/:id]` | admin |
+| GET/POST/PUT/DELETE | `/api/admin/staff[/:id]`, `/temp-password`, `/setup-email` | admin |
+| GET/POST/DELETE | `/api/admin/adjustments[/:id]` | admin |
+| GET | `/api/admin/reports/summary` | admin |
+| GET | `/api/export/my-requests.csv` · `my-balances.csv` | signed in |
+| GET | `/api/export/requests.csv` · `balances.csv` · `staff.csv` · `activity.csv` | admin |
 
-1. **Push to GitHub**
-   ```bash
-   git init && git add . && git commit -m "Leave portal"
-   git branch -M main
-   git remote add origin <YOUR_GITHUB_REPO_URL>
-   git push -u origin main
-   ```
-2. **Import in Vercel.** Go to Add New → Project and pick the repo. The settings come from `vercel.json` (framework Vite, output `dist`, `/api/*` goes to the function).
-3. **Set `JWT_SECRET`** under Project → Settings → Environment Variables. Generate one with:
-   ```bash
-   node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"
-   ```
-   Without it, login returns HTTP 500 on purpose. There is no built-in fallback secret.
-4. **Add a database.** Go to Project → Storage and add Postgres from the Marketplace (Neon or Supabase). It should inject `DATABASE_URL` or `POSTGRES_URL`, and the API accepts either. Use the **pooled** connection string.
-5. **Create tables and load staff** from your machine:
-   ```bash
-   npm i -g vercel && vercel link
-   vercel env pull .env.local          # pulls DATABASE_URL locally
-   npm run db:init
-   cp db/seed.example.json db/seed.json   # edit: real staff and entitlements
-   npm run db:seed                      # prints temporary passwords for new users
-   ```
-6. **Redeploy** so the function picks up the env vars. Then check that `https://<app>.vercel.app/api/health` returns `"storage":"postgres"`.
+## Not built yet
 
-To make changes later, edit `db/seed.json` and run `npm run db:seed` again. It updates names, roles, `active` and entitlements. It never overwrites existing passwords or `used_days`. To offboard someone, set `"active": false`.
-
-## What changed from the blueprint
-
-| Blueprint issue | Fix |
-|---|---|
-| In-memory data on serverless is lost on cold starts and differs between instances | Postgres store. Memory remains only as a labelled demo mode |
-| Plain-text passwords | bcrypt hashes. Users can change their password in the app |
-| Hard-coded JWT fallback secret (`super_secret_leave_portal_key`) lets anyone forge a manager token | `JWT_SECRET` is required on Vercel |
-| Any logged-in user could approve requests, including their own | Only managers can approve or reject, and never their own requests |
-| `user_id` came from the request body, so anyone could file leave for anyone | The applicant is always the signed-in user |
-| `total_days: 2` hard-coded in the UI | The server counts working days (Mon–Fri). The UI shows a preview |
-| Every employee could see everyone's requests and balances | Employees see only their own. Managers see the whole team |
-| Approving the same request twice deducted the balance twice | Only `Pending` requests can be decided. Updates use row locks inside a transaction |
-| Pending requests weren't counted, so staff could over-apply | Available = total − used − pending, checked on apply and again on approve |
-| No overlap check | Overlapping pending or approved requests are rejected |
-| `react-scripts` (Create React App) is deprecated | Vite |
-| Open `cors()` | Removed. The frontend and API share one origin |
-| JSX was lost in the PDF export | Rebuilt the frontend. Added cancel, filters, a balance breakdown and inline errors instead of `alert()` |
-
-## API
-
-All routes except login and health need `Authorization: Bearer <token>`.
-
-| Method | Path | Who | Notes |
-|---|---|---|---|
-| GET | `/api/health` | anyone | `{ storage: "postgres" \| "memory" }` |
-| POST | `/api/auth/login` | anyone | `{ email, password }` → `{ token, user }` |
-| GET | `/api/auth/me` | signed in | current user |
-| POST | `/api/auth/password` | signed in | `{ current_password, new_password }` |
-| GET | `/api/balances/:userId` | own / manager | `me` allowed. Includes `pending_days` |
-| GET | `/api/leave/requests` | signed in | Employees get their own. Managers get all (`?scope=mine` returns only theirs) |
-| POST | `/api/leave/apply` | signed in | `{ leave_type, start_date, end_date, reason }` |
-| PATCH | `/api/leave/requests/:id` | manager / owner | `{ status: "Approved" \| "Rejected" }` (manager) or `"Cancelled"` (owner, while pending) |
-
-## Known limitations (not built yet)
-
-- **Public holidays aren't excluded** from day counts. Only weekends are. Singapore PH would need a holiday table.
-- **No half-days.** Days are whole numbers.
-- **No annual reset or carry-forward.** Change entitlements with the seed script for now.
-- **Single approval tier.** Any manager can approve any non-manager. A manager's own leave needs a *different* manager, so if there is only one manager, their requests can't be approved in the app.
-- **No email or Slack notifications** for new or decided requests.
-- **Auth is email and password.** Google Workspace SSO would remove password handling entirely and is the recommended next step for internal use.
-- **No login rate limiting.** An in-memory limiter doesn't work across serverless instances. Use Vercel Firewall rules or an Upstash-backed limiter.
-- **The token is stored in `localStorage`** (same as the blueprint). An httpOnly cookie would be stronger against XSS.
-- **No HR/admin UI** for adding users or adjusting balances. It's script-based for now.
-
-## Things to verify on your first preview deploy
-
-These were tested locally (API tests on memory and Postgres 16, plus a browser walkthrough), but not on Vercel itself:
-
-- `/api/health` responds, which confirms the rewrite reaches Express with the original path.
-- Node `22.x` (from `engines`) is accepted by your Vercel project settings.
-- Your Postgres integration's env var name (`DATABASE_URL` or `POSTGRES_URL`) and SSL settings work with the pooled URL.
+- Half-day leave
+- Carry-forward or anniversary-based leave years
+- Multi-step approvals
+- Reminder or escalation emails when a request sits pending
+- Team calendar view
+- SSO

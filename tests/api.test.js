@@ -1,62 +1,45 @@
-// API tests. Run: npm test
-// Against Postgres instead of memory: TEST_DATABASE_URL=postgres://... npm test
-//   (WARNING: drops and recreates the leave portal tables in that database.)
+// API tests. Run: npm test   (uses PGlite in memory with the fictional demo data)
+// Against real Postgres: TEST_DATABASE_URL=postgres://... npm test
+//   WARNING: drops and recreates the leave portal tables in that database.
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const path = require('node:path');
 
 process.env.JWT_SECRET = 'test-secret';
+process.env.APP_URL = 'https://leave.example.test';
 delete process.env.DATABASE_URL;
 delete process.env.POSTGRES_URL;
 
 const app = require('../api/index.js');
-const { setStore } = require('../server/store');
-const { createMemoryStore, seed } = require('../server/store/memory');
-const { DAY_MS, toISODate } = require('../server/dates');
+const { setDb, createPgDriver, createPgliteDriver, SCHEMA_PATH } = require('../server/db');
+const { seedDemo } = require('../server/demo');
+const { setTestTransport } = require('../server/mailer');
+const { businessDaysInYear, currentYear } = require('../server/dates');
 
+const sent = [];
 let server;
 let base;
-let pgStore;
-
-async function seedPostgres(url) {
-  const { Client } = require('pg');
-  const { createPostgresStore } = require('../server/store/postgres');
-  const client = new Client({ connectionString: url });
-  await client.connect();
-  await client.query('DROP TABLE IF EXISTS leave_requests, leave_balances, users CASCADE');
-  await client.query(fs.readFileSync(path.join(__dirname, '..', 'db', 'schema.sql'), 'utf8'));
-  const data = seed();
-  for (const u of data.users) {
-    await client.query('INSERT INTO users (id, email, name, role, password_hash) VALUES ($1,$2,$3,$4,$5)', [u.id, u.email, u.name, u.role, u.password_hash]);
-  }
-  for (const b of data.balances) {
-    await client.query('INSERT INTO leave_balances (id, user_id, leave_type, total_days, used_days) VALUES ($1,$2,$3,$4,$5)', [b.id, b.user_id, b.leave_type, b.total_days, b.used_days]);
-  }
-  for (const r of data.requests) {
-    await client.query('INSERT INTO leave_requests (id, user_id, leave_type, start_date, end_date, total_days, reason, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-      [r.id, r.user_id, r.leave_type, r.start_date, r.end_date, r.total_days, r.reason, r.status]);
-  }
-  await client.query("SELECT setval('users_id_seq', 100), setval('leave_balances_id_seq', 100), setval('leave_requests_id_seq', 100)");
-  await client.end();
-  return createPostgresStore(url);
-}
+let driver;
 
 before(async () => {
   if (process.env.TEST_DATABASE_URL) {
-    pgStore = await seedPostgres(process.env.TEST_DATABASE_URL);
-    setStore(pgStore);
+    driver = createPgDriver(process.env.TEST_DATABASE_URL);
+    await driver.query('DROP TABLE IF EXISTS audit_log, password_tokens, leave_requests, balance_adjustments, entitlements, users, leave_types CASCADE');
+    await driver.query(fs.readFileSync(SCHEMA_PATH, 'utf8'));
+    await seedDemo(driver);
   } else {
-    setStore(createMemoryStore());
+    driver = await createPgliteDriver({ demo: true });
   }
+  setDb(driver);
+  setTestTransport({ sendMail: async (m) => { sent.push(m); return { messageId: String(sent.length) }; } });
   await new Promise((resolve) => { server = app.listen(0, resolve); });
   base = `http://127.0.0.1:${server.address().port}`;
 });
 
 after(async () => {
   server.close();
-  if (pgStore) await pgStore.pool.end();
+  await driver.end();
 });
 
 async function call(method, url, { token, body } = {}) {
@@ -65,161 +48,276 @@ async function call(method, url, { token, body } = {}) {
     headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
-  return { status: res.status, data: await res.json() };
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = text; }
+  return { status: res.status, data, headers: res.headers };
 }
+const login = async (email, password = 'password123') => (await call('POST', '/api/auth/login', { body: { email, password } })).data.token;
+const apply = (token, body) => call('POST', '/api/requests', { token, body });
 
-const loginAs = async (email) => (await call('POST', '/api/auth/login', { body: { email, password: 'password123' } })).data.token;
+// Monday of ISO-ish week n in 2027 (2027-01-04 is a Monday).
+const mon2027 = (week, plus = 0) => new Date(Date.UTC(2027, 0, 4 + week * 7 + plus)).toISOString().slice(0, 10);
 
-// Monday N weeks from the seeded request's week (seed uses next Monday).
-function mondayInWeeks(n) {
-  const now = new Date();
-  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-  const wd = new Date(today).getUTCDay();
-  const next = today + (((8 - wd) % 7) || 7) * DAY_MS;
-  return next + n * 7 * DAY_MS;
-}
-const day = (t, offset = 0) => toISODate(new Date(t + offset * DAY_MS));
+const T = {};
 
-let emp, mgr, alex;
-
-test('health reports storage backend', async () => {
-  const { status, data } = await call('GET', '/api/health');
-  assert.equal(status, 200);
-  assert.equal(data.storage, process.env.TEST_DATABASE_URL ? 'postgres' : 'memory');
+test('health reports database and email status', async () => {
+  const { data } = await call('GET', '/api/health');
+  assert.equal(data.database, process.env.TEST_DATABASE_URL ? 'postgres' : 'pglite');
+  assert.equal(data.email, true);
+  assert.equal(data.app_url, true);
 });
 
-test('login rejects bad credentials and accepts good ones (case-insensitive email)', async () => {
-  assert.equal((await call('POST', '/api/auth/login', { body: { email: 'employee@company.com', password: 'nope' } })).status, 401);
-  assert.equal((await call('POST', '/api/auth/login', { body: { email: 'ghost@company.com', password: 'password123' } })).status, 401);
-  const ok = await call('POST', '/api/auth/login', { body: { email: 'Employee@Company.com ', password: 'password123' } });
+test('login + roles', async () => {
+  assert.equal((await call('POST', '/api/auth/login', { body: { email: 'admin@example.com', password: 'nope' } })).status, 401);
+  const res = await call('POST', '/api/auth/login', { body: { email: ' Admin@Example.com', password: 'password123' } });
+  assert.equal(res.status, 200);
+  assert.equal(res.data.user.role, 'admin');
+  assert.equal(res.data.user.password_hash, undefined);
+  T.admin = res.data.token; // Hannah, PH, manager Marcus
+  T.marcus = await login('ceo@example.com'); // approver, SG
+  T.priya = await login('coo@example.com'); // approver, SG
+  T.daniel = await login('employee@example.com'); // user, SG, manager Marcus
+  T.carlo = await login('dev@example.com'); // user, PH, manager Priya
+});
+
+test('leave options apply N/A + Singapore-only childcare rule', async () => {
+  const carlo = (await call('GET', '/api/my/leave-options', { token: T.carlo })).data.map((o) => o.leave_type);
+  const daniel = (await call('GET', '/api/my/leave-options', { token: T.daniel })).data;
+  assert.ok(!carlo.includes('Childcare Leave'));
+  assert.ok(daniel.some((o) => o.leave_type === 'Childcare Leave'));
+  assert.equal(daniel.find((o) => o.leave_type === 'Unpaid Leave').unlimited, true);
+
+  const r = await apply(T.carlo, { leave_type: 'Childcare Leave', start_date: mon2027(1), end_date: mon2027(1) });
+  assert.equal(r.status, 400);
+
+  // Moving Daniel to the Philippines hides childcare even though the entitlement row exists.
+  const staff = (await call('GET', '/api/admin/staff', { token: T.admin })).data;
+  const danielId = staff.find((s) => s.email === 'employee@example.com').id;
+  T.danielId = danielId;
+  await call('PUT', `/api/admin/staff/${danielId}`, { token: T.admin, body: { location: 'Philippines' } });
+  assert.ok(!(await call('GET', '/api/my/leave-options', { token: T.daniel })).data.some((o) => o.leave_type === 'Childcare Leave'));
+  await call('PUT', `/api/admin/staff/${danielId}`, { token: T.admin, body: { location: 'Singapore' } });
+});
+
+test('unlimited leave requires a note; request routes to line manager by email', async () => {
+  sent.length = 0;
+  assert.equal((await apply(T.daniel, { leave_type: 'Other Leave', start_date: mon2027(2), end_date: mon2027(2) })).status, 400);
+  const r = await apply(T.daniel, { leave_type: 'Other Leave', details: 'Bereavement', start_date: mon2027(2), end_date: mon2027(2, 1), reason: 'Family' });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  assert.equal(r.data.request.total_days, 2);
+  assert.equal(r.data.email, true);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].to, ['ceo@example.com']);
+  assert.match(sent[0].text, /Bereavement/);
+  assert.match(sent[0].text, new RegExp(`https://leave.example.test/\\?view=approvals&request=${r.data.request.id}`));
+  T.danielOther = r.data.request.id;
+});
+
+test('visibility: users see only their own data; approvers see direct reports', async () => {
+  assert.equal((await call('GET', '/api/balances?scope=team', { token: T.daniel })).status, 403);
+  assert.equal((await call('GET', '/api/requests?scope=all', { token: T.daniel })).status, 403);
+  assert.equal((await call('GET', '/api/requests?scope=approvals', { token: T.daniel })).status, 403);
+  const mine = (await call('GET', '/api/requests', { token: T.daniel })).data;
+  assert.ok(mine.every((r) => r.employee_name === 'Daniel Ong'));
+
+  const marcusTeam = (await call('GET', '/api/balances?scope=team', { token: T.marcus })).data.map((p) => p.name).sort();
+  assert.deepEqual(marcusTeam, ['Daniel Ong', 'Hannah Reyes', 'Priya Nair']);
+  const priyaQueue = (await call('GET', '/api/requests?scope=approvals', { token: T.priya })).data;
+  assert.ok(priyaQueue.every((r) => ['Carlo Santos', 'Marcus Lee'].includes(r.employee_name)));
+  assert.equal((await call('GET', '/api/balances?scope=all', { token: T.marcus })).status, 403);
+});
+
+test('approval: only line manager or HR admin; decision emails the employee', async () => {
+  assert.equal((await call('PATCH', `/api/requests/${T.danielOther}`, { token: T.priya, body: { status: 'Approved' } })).status, 403);
+  assert.equal((await call('PATCH', `/api/requests/${T.danielOther}`, { token: T.daniel, body: { status: 'Approved' } })).status, 403);
+  sent.length = 0;
+  const ok = await call('PATCH', `/api/requests/${T.danielOther}`, { token: T.marcus, body: { status: 'Approved', note: 'Take care' } });
   assert.equal(ok.status, 200);
-  assert.equal(ok.data.user.role, 'employee');
-  assert.equal(ok.data.user.password_hash, undefined);
-  emp = ok.data.token;
-  mgr = await loginAs('manager@company.com');
-  alex = await loginAs('alex@company.com');
+  assert.equal(ok.data.request.decided_by_name, 'Marcus Lee');
+  assert.deepEqual(sent[0].to, ['employee@example.com']);
+  assert.match(sent[0].subject, /approved/);
+  assert.equal((await call('PATCH', `/api/requests/${T.danielOther}`, { token: T.marcus, body: { status: 'Rejected' } })).status, 409);
+
+  // HR admin can approve someone who isn't their direct report (line manager unavailable).
+  const c = await apply(T.carlo, { leave_type: 'Annual Leave', start_date: mon2027(3), end_date: mon2027(3, 4) });
+  assert.equal(c.status, 201);
+  assert.deepEqual(sent.at(-1).to, ['coo@example.com']);
+  const byHr = await call('PATCH', `/api/requests/${c.data.request.id}`, { token: T.admin, body: { status: 'Rejected', note: 'Clashes with audit' } });
+  assert.equal(byHr.status, 200);
+  assert.match(sent.at(-1).subject, /rejected/);
 });
 
-test('protected routes require a valid token', async () => {
-  assert.equal((await call('GET', '/api/leave/requests')).status, 401);
-  assert.equal((await call('GET', '/api/leave/requests', { token: 'garbage' })).status, 401);
+test('nobody approves their own leave, including the HR admin', async () => {
+  const h = await apply(T.admin, { leave_type: 'Annual Leave', start_date: mon2027(4), end_date: mon2027(4) });
+  assert.equal(h.status, 201);
+  assert.deepEqual(sent.at(-1).to, ['ceo@example.com']); // Hannah's line manager
+  assert.equal((await call('PATCH', `/api/requests/${h.data.request.id}`, { token: T.admin, body: { status: 'Approved' } })).status, 403);
+  assert.equal((await call('PUT', `/api/admin/requests/${h.data.request.id}`, { token: T.admin, body: { status: 'Approved' } })).status, 403);
+  assert.equal((await call('PATCH', `/api/requests/${h.data.request.id}`, { token: T.marcus, body: { status: 'Approved' } })).status, 200);
 });
 
-test('employees see only their own balances and requests', async () => {
-  const bal = await call('GET', '/api/balances/me', { token: emp });
-  assert.equal(bal.status, 200);
-  const vacation = bal.data.find((b) => b.leave_type === 'Vacation');
-  assert.equal(vacation.pending_days, 3);
-  assert.equal((await call('GET', '/api/balances/2', { token: emp })).status, 403);
-  assert.equal((await call('GET', '/api/balances/1', { token: mgr })).status, 200);
+test('balances: limits, pending counted, per-year split, adjustments', async () => {
+  // Carlo: Sick 7/yr. 8 working days → rejected.
+  assert.equal((await apply(T.carlo, { leave_type: 'Sick Leave', start_date: mon2027(6), end_date: mon2027(7, 2) })).status, 400);
 
-  const alexReqs = await call('GET', '/api/leave/requests', { token: alex });
-  assert.deepEqual(alexReqs.data, []);
-  const all = await call('GET', '/api/leave/requests', { token: mgr });
-  assert.equal(all.data.length, 1);
-  assert.equal(all.data[0].employee_name, 'John Doe');
+  // Annual across New Year 2027 → 2028 is split by calendar year.
+  const start = '2027-12-29';
+  const end = '2028-01-04';
+  const r = await apply(T.carlo, { leave_type: 'Annual Leave', start_date: start, end_date: end });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  const y27 = (await call('GET', '/api/balances?year=2027', { token: T.carlo })).data[0].balances.find((b) => b.leave_type === 'Annual Leave');
+  const y28 = (await call('GET', '/api/balances?year=2028', { token: T.carlo })).data[0].balances.find((b) => b.leave_type === 'Annual Leave');
+  assert.equal(y27.pending, businessDaysInYear(start, end, 2027));
+  assert.equal(y28.pending, businessDaysInYear(start, end, 2028));
+  assert.equal(y28.available, 12 - y28.pending); // fresh entitlement on 1 Jan, no carry-forward
+
+  // Admin deducts 3 days of 2027 Annual Leave taken before go-live.
+  const carloId = (await call('GET', '/api/admin/staff', { token: T.admin })).data.find((s) => s.email === 'dev@example.com').id;
+  T.carloId = carloId;
+  const adj = await call('POST', '/api/admin/adjustments', { token: T.admin, body: { user_id: carloId, leave_type: 'Annual Leave', year: 2027, days: -3, reason: 'Taken before portal launch' } });
+  assert.equal(adj.status, 201);
+  const after = (await call('GET', '/api/balances?year=2027', { token: T.carlo })).data[0].balances.find((b) => b.leave_type === 'Annual Leave');
+  assert.equal(after.adjustment, -3);
+  assert.equal(after.available, y27.available - 3);
+  assert.equal((await call('POST', '/api/admin/adjustments', { token: T.admin, body: { user_id: carloId, leave_type: 'Unpaid Leave', year: 2027, days: 2, reason: 'x y z' } })).status, 400);
+  assert.equal((await call('POST', '/api/admin/adjustments', { token: T.carlo, body: { user_id: carloId, leave_type: 'Annual Leave', year: 2027, days: 5, reason: 'self-serve' } })).status, 403);
 });
 
-test('apply: validates dates and computes working days server-side', async () => {
-  const mon = mondayInWeeks(2);
-  const sat = day(mon, 5), sun = day(mon, 6);
-  assert.equal((await call('POST', '/api/leave/apply', { token: emp, body: { leave_type: 'Vacation', start_date: sat, end_date: sun } })).status, 400);
-  assert.equal((await call('POST', '/api/leave/apply', { token: emp, body: { leave_type: 'Vacation', start_date: day(mon, 4), end_date: day(mon) } })).status, 400);
-  assert.equal((await call('POST', '/api/leave/apply', { token: emp, body: { leave_type: 'Vacation', start_date: '2026-02-31', end_date: '2026-03-02' } })).status, 400);
-  assert.equal((await call('POST', '/api/leave/apply', { token: emp, body: { leave_type: 'Unicorn', start_date: day(mon), end_date: day(mon) } })).status, 400);
+test('concurrent requests cannot overdraw a balance', async () => {
+  // Carlo: Sick 7 in 2027. Three simultaneous 3-day requests → only two fit.
+  const results = await Promise.all([10, 11, 12].map((w) => apply(T.carlo, { leave_type: 'Sick Leave', start_date: mon2027(w), end_date: mon2027(w, 2) })));
+  assert.deepEqual(results.map((r) => r.status).sort(), [201, 201, 400]);
+});
 
-  // Mon → next Mon spans a weekend: 6 working days. Client-sent total_days and user_id are ignored.
-  const res = await call('POST', '/api/leave/apply', {
-    token: emp,
-    body: { user_id: 3, leave_type: 'Vacation', start_date: day(mon), end_date: day(mon, 7), total_days: 1, reason: 'Holiday' },
+test('overlaps rejected; owner can cancel only pending', async () => {
+  const a = await apply(T.daniel, { leave_type: 'Annual Leave', start_date: mon2027(20), end_date: mon2027(20, 2) });
+  assert.equal(a.status, 201);
+  assert.equal((await apply(T.daniel, { leave_type: 'Sick Leave', start_date: mon2027(20, 1), end_date: mon2027(20, 1) })).status, 409);
+  assert.equal((await call('PATCH', `/api/requests/${a.data.request.id}`, { token: T.carlo, body: { status: 'Cancelled' } })).status, 403);
+  assert.equal((await call('PATCH', `/api/requests/${a.data.request.id}`, { token: T.daniel, body: { status: 'Cancelled' } })).status, 200);
+  assert.equal((await call('PATCH', `/api/requests/${T.danielOther}`, { token: T.daniel, body: { status: 'Cancelled' } })).status, 409);
+});
+
+test('admin can add, edit and delete any leave entry', async () => {
+  const created = await call('POST', '/api/admin/requests', { token: T.admin, body: { user_id: T.carloId, leave_type: 'Public Holiday', start_date: mon2027(15), end_date: mon2027(15), status: 'Approved' } });
+  assert.equal(created.status, 201);
+  assert.equal(created.data.request.status, 'Approved');
+  const id = created.data.request.id;
+
+  const edited = await call('PUT', `/api/admin/requests/${id}`, { token: T.admin, body: { end_date: mon2027(15, 1), details: '', reason: 'Two local holidays' } });
+  assert.equal(edited.status, 200);
+  assert.equal(edited.data.request.total_days, 2);
+  assert.equal((await call('PUT', `/api/admin/requests/${id}`, { token: T.marcus, body: { reason: 'x' } })).status, 403);
+  assert.equal((await call('DELETE', `/api/admin/requests/${id}`, { token: T.admin })).status, 200);
+  assert.equal((await call('DELETE', `/api/admin/requests/${id}`, { token: T.admin })).status, 404);
+});
+
+test('staff admin: create, temp password, forced change, setup email + reset', async () => {
+  // Line manager must be an approver/admin.
+  const bad = await call('POST', '/api/admin/staff', { token: T.admin, body: { name: 'New Person', email: 'new@example.com', location: 'Vietnam', role: 'user', manager_id: T.carloId, entitlements: {} } });
+  assert.equal(bad.status, 400);
+
+  const priyaId = (await call('GET', '/api/admin/staff', { token: T.admin })).data.find((s) => s.email === 'coo@example.com').id;
+  const created = await call('POST', '/api/admin/staff', {
+    token: T.admin,
+    body: { name: 'New Person', email: 'New@Example.com', location: 'Vietnam', role: 'user', manager_id: priyaId,
+      entitlements: { 'Annual Leave': 12, 'Sick Leave': 7, 'Childcare Leave': 'na', 'Unpaid Leave': 'unlimited' } },
   });
-  assert.equal(res.status, 201, JSON.stringify(res.data));
-  assert.equal(res.data.request.total_days, 6);
-  assert.equal(res.data.request.user_id, 1);
-  assert.equal(res.data.request.status, 'Pending');
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const newId = created.data.id;
+  assert.equal((await call('POST', '/api/admin/staff', { token: T.admin, body: { name: 'Dup', email: 'new@example.com', location: 'X', role: 'user' } })).status, 409);
+
+  // No password yet → cannot log in.
+  assert.equal((await call('POST', '/api/auth/login', { body: { email: 'new@example.com', password: 'anything12' } })).status, 401);
+
+  const temp = await call('POST', `/api/admin/staff/${newId}/temp-password`, { token: T.admin });
+  assert.equal(temp.status, 200);
+  const tok = await login('new@example.com', temp.data.password);
+  assert.equal((await call('GET', '/api/balances', { token: tok })).status, 403); // must change first
+  assert.equal((await call('GET', '/api/auth/me', { token: tok })).data.user.must_change_password, true);
+  assert.equal((await call('POST', '/api/auth/password', { token: tok, body: { current_password: temp.data.password, new_password: 'short' } })).status, 400);
+  const changed = await call('POST', '/api/auth/password', { token: tok, body: { current_password: temp.data.password, new_password: 'a-much-longer-pass' } });
+  assert.equal(changed.status, 200);
+  assert.equal((await call('GET', '/api/balances', { token: tok })).status, 401); // old token revoked
+  const opts = (await call('GET', '/api/my/leave-options', { token: changed.data.token })).data.map((o) => o.leave_type);
+  assert.deepEqual(opts, ['Annual Leave', 'Sick Leave', 'Unpaid Leave']);
+
+  // Set-up email → link → reset.
+  sent.length = 0;
+  assert.equal((await call('POST', `/api/admin/staff/${newId}/setup-email`, { token: T.admin })).status, 200);
+  const link = sent[0].text.match(/\?reset=([\w-]+)/);
+  assert.ok(link, 'reset link in email');
+  assert.equal((await call('POST', '/api/auth/reset', { body: { token: link[1], new_password: 'brand-new-password' } })).status, 200);
+  assert.equal((await call('POST', '/api/auth/reset', { body: { token: link[1], new_password: 'brand-new-password' } })).status, 400); // single use
+  assert.equal((await call('GET', '/api/balances', { token: changed.data.token })).status, 401);
+  assert.ok(await login('new@example.com', 'brand-new-password'));
+
+  // Forgot password: same response for unknown emails, and no email for them.
+  sent.length = 0;
+  const known = await call('POST', '/api/auth/forgot', { body: { email: 'new@example.com' } });
+  const unknown = await call('POST', '/api/auth/forgot', { body: { email: 'ghost@example.com' } });
+  assert.equal(known.data.message, unknown.data.message);
+  assert.equal(sent.length, 1);
+
+  // Deactivate → session dies. No requests → can be deleted.
+  const t2 = await login('new@example.com', 'brand-new-password');
+  await call('PUT', `/api/admin/staff/${newId}`, { token: T.admin, body: { active: false } });
+  assert.equal((await call('GET', '/api/balances', { token: t2 })).status, 401);
+  assert.equal((await call('DELETE', `/api/admin/staff/${newId}`, { token: T.admin })).status, 200);
+  // Staff with history can't be deleted (deactivate instead).
+  assert.equal((await call('DELETE', `/api/admin/staff/${T.carloId}`, { token: T.admin })).status, 409);
 });
 
-test('apply: rejects overlaps and counts pending days against balance', async () => {
-  const mon = mondayInWeeks(2);
-  const overlap = await call('POST', '/api/leave/apply', { token: emp, body: { leave_type: 'Sick', start_date: day(mon, 2), end_date: day(mon, 2) } });
-  assert.equal(overlap.status, 409);
-
-  // Vacation: 15 total - 3 used - 3 pending - 6 pending = 3 available. Ask for 4.
-  const later = mondayInWeeks(5);
-  const tooMany = await call('POST', '/api/leave/apply', { token: emp, body: { leave_type: 'Vacation', start_date: day(later), end_date: day(later, 3) } });
-  assert.equal(tooMany.status, 400);
-  assert.match(tooMany.data.error, /3 available/);
+test('admin guard rails', async () => {
+  const me = (await call('GET', '/api/auth/me', { token: T.admin })).data.user;
+  assert.equal((await call('PUT', `/api/admin/staff/${me.id}`, { token: T.admin, body: { role: 'user' } })).status, 400);
+  assert.equal((await call('PUT', `/api/admin/staff/${me.id}`, { token: T.admin, body: { active: false } })).status, 400);
+  assert.equal((await call('DELETE', `/api/admin/staff/${me.id}`, { token: T.admin })).status, 400);
+  assert.equal((await call('GET', '/api/admin/staff', { token: T.marcus })).status, 403);
 });
 
-test('approvals: role checks, no self-approval, balance deducted exactly once', async () => {
-  const requests = (await call('GET', '/api/leave/requests', { token: mgr })).data;
-  const target = requests.find((r) => r.user_id === 1 && r.total_days === 3);
+test('reports and CSV exports (with formula-injection guard)', async () => {
+  const r = await apply(T.daniel, { leave_type: 'Annual Leave', start_date: mon2027(30), end_date: mon2027(30), reason: '=HYPERLINK("http://evil")' });
+  assert.equal(r.status, 201);
+  const csv = await call('GET', '/api/export/my-requests.csv?year=2027', { token: T.daniel });
+  assert.equal(csv.status, 200);
+  assert.match(csv.headers.get('content-disposition'), /my-leave-history-2027\.csv/);
+  assert.match(csv.data, /"'=HYPERLINK\(""http:\/\/evil""\)"/);
+  assert.ok(!csv.data.includes('Carlo'));
 
-  assert.equal((await call('PATCH', `/api/leave/requests/${target.id}`, { token: emp, body: { status: 'Approved' } })).status, 403);
-  assert.equal((await call('PATCH', `/api/leave/requests/${target.id}`, { token: mgr, body: { status: 'Maybe' } })).status, 400);
+  const bal = await call('GET', '/api/export/my-balances.csv?year=2027', { token: T.daniel });
+  assert.match(bal.data, /Annual Leave/);
+  assert.equal((await call('GET', '/api/export/balances.csv', { token: T.daniel })).status, 403);
+  const all = await call('GET', '/api/export/balances.csv?year=2027', { token: T.admin });
+  assert.match(all.data, /Carlo Santos/);
+  assert.match((await call('GET', '/api/export/staff.csv', { token: T.admin })).data, /Childcare Leave/);
+  assert.match((await call('GET', '/api/export/activity.csv', { token: T.admin })).data, /approved/);
 
-  const approved = await call('PATCH', `/api/leave/requests/${target.id}`, { token: mgr, body: { status: 'Approved' } });
-  assert.equal(approved.status, 200);
-  assert.equal(approved.data.request.decided_by_name, 'Jane Smith');
-  assert.equal((await call('PATCH', `/api/leave/requests/${target.id}`, { token: mgr, body: { status: 'Approved' } })).status, 409);
-
-  const vacation = (await call('GET', '/api/balances/me', { token: emp })).data.find((b) => b.leave_type === 'Vacation');
-  assert.equal(vacation.used_days, 6);
-  assert.equal(vacation.pending_days, 6);
-
-  // Manager applies for own leave, then cannot approve it.
-  const mon = mondayInWeeks(3);
-  const own = await call('POST', '/api/leave/apply', { token: mgr, body: { leave_type: 'Vacation', start_date: day(mon), end_date: day(mon) } });
-  assert.equal(own.status, 201);
-  assert.equal((await call('PATCH', `/api/leave/requests/${own.data.request.id}`, { token: mgr, body: { status: 'Approved' } })).status, 403);
-  const mine = await call('GET', '/api/leave/requests?scope=mine', { token: mgr });
-  assert.ok(mine.data.every((r) => r.user_id === 2));
+  const summary = await call('GET', '/api/admin/reports/summary', { token: T.admin });
+  assert.equal(summary.status, 200);
+  assert.equal(typeof summary.data.pending_count, 'number');
+  assert.ok(summary.data.activity.length > 5);
+  assert.equal(summary.data.today.slice(0, 4), String(currentYear()));
 });
 
-test('cancel: only the owner, only while pending', async () => {
-  const requests = (await call('GET', '/api/leave/requests', { token: emp })).data;
-  const pending = requests.find((r) => r.status === 'Pending');
-  const approved = requests.find((r) => r.status === 'Approved');
-
-  assert.equal((await call('PATCH', `/api/leave/requests/${pending.id}`, { token: alex, body: { status: 'Cancelled' } })).status, 403);
-  assert.equal((await call('PATCH', `/api/leave/requests/${approved.id}`, { token: emp, body: { status: 'Cancelled' } })).status, 409);
-  const ok = await call('PATCH', `/api/leave/requests/${pending.id}`, { token: emp, body: { status: 'Cancelled' } });
-  assert.equal(ok.status, 200);
-  const vacation = (await call('GET', '/api/balances/me', { token: emp })).data.find((b) => b.leave_type === 'Vacation');
-  assert.equal(vacation.pending_days, 0);
-  assert.equal((await call('PATCH', '/api/leave/requests/9999', { token: mgr, body: { status: 'Approved' } })).status, 404);
+test('account lockout after 5 failed attempts', async () => {
+  for (let i = 0; i < 5; i += 1) {
+    assert.equal((await call('POST', '/api/auth/login', { body: { email: 'coo@example.com', password: 'wrong-password' } })).status, 401);
+  }
+  const locked = await call('POST', '/api/auth/login', { body: { email: 'coo@example.com', password: 'password123' } });
+  assert.equal(locked.status, 429);
 });
 
-test('change password', async () => {
-  assert.equal((await call('POST', '/api/auth/password', { token: alex, body: { current_password: 'wrong', new_password: 'newpassword1' } })).status, 400);
-  assert.equal((await call('POST', '/api/auth/password', { token: alex, body: { current_password: 'password123', new_password: 'short' } })).status, 400);
-  assert.equal((await call('POST', '/api/auth/password', { token: alex, body: { current_password: 'password123', new_password: 'newpassword1' } })).status, 200);
-  assert.equal((await call('POST', '/api/auth/login', { body: { email: 'alex@company.com', password: 'password123' } })).status, 401);
-  assert.equal((await call('POST', '/api/auth/login', { body: { email: 'alex@company.com', password: 'newpassword1' } })).status, 200);
-});
-
-test('concurrent applications cannot overdraw a balance', async () => {
-  // Alex: Sick 10 days. Four simultaneous 3-day requests in different weeks → only 3 fit.
-  const results = await Promise.all([6, 7, 8, 9].map((w) => {
-    const mon = mondayInWeeks(w);
-    return call('POST', '/api/leave/apply', { token: alex, body: { leave_type: 'Sick', start_date: day(mon), end_date: day(mon, 2) } });
-  }));
-  const statuses = results.map((r) => r.status).sort();
-  assert.deepEqual(statuses, [201, 201, 201, 400]);
-});
-
-test('unknown routes and bad JSON', async () => {
-  assert.equal((await call('GET', '/api/nope', { token: emp })).status, 404);
+test('bad input, unknown routes, missing JWT secret', async () => {
+  assert.equal((await call('GET', '/api/nope', { token: T.daniel })).status, 404);
   const res = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{bad' });
   assert.equal(res.status, 400);
-});
-
-test('refuses to issue tokens without JWT_SECRET', async () => {
+  assert.equal((await apply(T.daniel, { leave_type: 'Annual Leave', start_date: '2027-02-31', end_date: '2027-03-01' })).status, 400);
+  assert.equal((await apply(T.daniel, { leave_type: 'Annual Leave', start_date: mon2027(40, 5), end_date: mon2027(40, 6) })).status, 400);
   delete process.env.JWT_SECRET;
   try {
-    const res = await call('POST', '/api/auth/login', { body: { email: 'employee@company.com', password: 'password123' } });
-    assert.equal(res.status, 500);
-    assert.match(res.data.error, /JWT_SECRET/);
+    assert.equal((await call('POST', '/api/auth/login', { body: { email: 'employee@example.com', password: 'password123' } })).status, 500);
   } finally {
     process.env.JWT_SECRET = 'test-secret';
   }
